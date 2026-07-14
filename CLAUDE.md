@@ -124,3 +124,6 @@ first-time friction, so don't expect tight day-for-day precision here.*
 - `git init`'d the repo locally (default branch `master`). Added a
   Go-appropriate `.gitignore` (build artifacts, `.env`, and local tool
   config `.claude/`/`.directory` which don't belong in the repo).
+- Connected the local repo to `git@github.com:hadi-moustafa/Governor.git`
+  (SSH — an existing ed25519 key on this machine was already authorized
+  with the `hadi-moustafa` GitHub account) and pushed `master` upstream.
