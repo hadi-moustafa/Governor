@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go version *)",
+      "Bash(mkdir -p cmd/governor cmd/governorctl cmd/mockprovider internal/proxy internal/budget internal/provider internal/ledger)",
+      "Bash(git init *)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ],
+    "additionalDirectories": [
+      "/home/HM/code/Governor/cmd"
+    ]
+  }
+}
