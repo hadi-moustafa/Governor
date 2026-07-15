@@ -21,6 +21,8 @@ plan change) — don't let it go stale.
 /internal/proxy     - forwards requests to a provider, streams response, meters cost live
 /internal/budget    - atomic reserve/decrement of spend caps (in-memory default, Redis-backed optional), pre-flight checks
 /internal/provider  - Provider interface + adapters (mock, OpenAI, Anthropic, ...)
+/internal/mockprovider - fake streaming LLM backend logic (cmd/mockprovider is a thin flag wrapper around this)
+/internal/pricing   - token-count -> cost; currently a trivial flat-rate stub, real pricing table is Phase 2
 /internal/ledger    - durable reconciled cost records (Postgres), source of truth post-stream
 ```
 
@@ -186,3 +188,84 @@ first-time friction, so don't expect tight day-for-day precision here.*
   beyond the pitch: `MemoryStore` is ~25ns/op vs. `RedisStore`'s ~95µs/op,
   roughly 3,700x — the network hop was real, avoidable cost for the
   common single-process case.
+
+### 2026-07-15 (continued)
+- Built the rest of Phase 1 Day 1-2 and the mid-stream cutoff deliverable
+  together, aimed at the hardest claim in the plan: a budget denial
+  mid-stream has to cancel the *upstream* provider request, not just stop
+  forwarding to the client. Stopping the client-facing stream alone proves
+  nothing — a naive implementation could do that while the fake provider
+  keeps generating (and Governor keeps "paying" for) chunks nobody
+  receives.
+- `internal/provider/provider.go`: filled in the `Provider`/`Stream`/
+  `Chunk`/`Request` types. `Stream` is pull-based (`Next() (Chunk, error)`,
+  `Close() error`) with a single cancellation point — the `ctx` passed to
+  `Send`. `Next()` deliberately takes no `ctx` of its own: one `cancel()`
+  call has to stop the whole call (connect, headers, every body read), so
+  there's exactly one place to get cancellation right, not two to
+  accidentally half-cancel. Pull over push (a chunk channel) for the same
+  reason — a channel-based adapter would need its own goroutine racing a
+  `select` against `ctx.Done()`, duplicating cancellation logic the HTTP
+  transport already gives you for free when the request is built with
+  `http.NewRequestWithContext`.
+- `internal/mockprovider` (new package, logic split out of `cmd/mockprovider`
+  so it's importable from tests): an SSE server that streams
+  `Config.Chunks` fake chunks `Config.ChunkDelay` apart, checking
+  `r.Context().Done()` between every chunk (not just once per loop) so
+  cancellation is caught promptly. Records `Stats` — chunks written,
+  whether it ran to completion, whether it observed the client
+  disconnecting, handler duration. This is the crux of proving the
+  cancellation claim: `net/http` only cancels a server request's context
+  when the underlying TCP connection is actually closed, so `Stats`
+  flipping to "canceled" is a real consequence of the socket dying, not an
+  inference from what the client saw. Only provable against a real
+  `httptest.NewServer` (a real loopback socket) — an in-memory handler
+  call wouldn't exhibit this.
+- `internal/provider/mock`: the client adapter implementing
+  `provider.Provider` against the mock server's wire format
+  (`data: {"delta":...,"tokens":...,"finish_reason":...}`, terminated by
+  `data: [DONE]`). Uses `http.NewRequestWithContext` — the other half of
+  the cancellation mechanism, the one that actually closes the socket when
+  `ctx` is canceled.
+- `internal/pricing`: trivial flat-rate stub (`MicrosPerToken`, one method
+  `CostMicros`) standing in for Phase 2's real per-model pricing table —
+  explicitly not a design decision to revisit now, just enough to turn
+  token counts into `budget.Store.Reserve` calls.
+- `internal/proxy`: `Handler.ServeHTTP` does a preflight `Reserve` (denied
+  → 429, provider never called, per `Store.Reserve`'s own contract), then
+  `runStream` (`stream.go`) opens the upstream call on a
+  `context.WithCancel(r.Context())` and, per chunk: `Store.Reserve` the
+  chunk's cost, and if denied, call `cancel()` — the same `CancelFunc`
+  whose `ctx` was threaded into `Provider.Send` — before writing a
+  `budget_exceeded` event and returning. The chunk that trips the cap is
+  never forwarded to the client, mirroring `Store.Reserve`'s "never reach
+  a provider" contract on the client-facing side. Went with per-chunk
+  `Reserve` calls over batching: `MemoryStore` is ~25ns/op so the
+  round-trip is free at any realistic chunk cadence, and batching would
+  reintroduce exactly the overshoot-before-noticing gap this milestone
+  exists to close, to save round trips nothing here is bottlenecked on.
+- Proof, both automated and manual:
+  - `internal/proxy/proxy_test.go`'s `TestServeHTTP_CutoffCancelsUpstream`
+    fires a request at a cap sized to trip mid-stream, then asserts on the
+    mock provider's own `Stats` (via `mp.Await`) — `Completed == false`,
+    `CanceledByClient == true`, chunks written well under half the
+    configured total, handler duration well under full-completion time.
+    A regression (upstream never actually canceled) fails fast, bounded
+    by the mock's configured duration, not a hang.
+  - Manually: ran `go run ./cmd/mockprovider -chunks 30 -delay 100ms` and
+    `go run ./cmd/governor -cap 0.06`, then `curl`'d a request. Client
+    stream cut off after exactly 5 chunks at ~0.6s (cap trips on the 6th
+    chunk's reservation, as sized) instead of the full 30 chunks/~3s.
+    `ss -tn` immediately after confirmed zero lingering connections to
+    the mock provider's port — the upstream socket was actually closed,
+    not just abandoned.
+  - `go build ./...`, `go vet ./...`, and `go test -race ./...` all clean
+    across every package, including the new `internal/mockprovider` and
+    `internal/provider/mock` test suites.
+- Still open, flagged not dropped: the budget reservation key is a
+  hardcoded placeholder (`"default"`) — same open item as the
+  budget-store step, still waiting on an auth/key scheme; the "second
+  fake provider with different quirks" sub-bullet under Phase 1's
+  Provider-adapter item wasn't built in this step; pricing is one flat
+  rate with no input/output split; `budget.Store.Refund` stays unexercised
+  outside its own package until reconciliation exists.
