@@ -19,7 +19,7 @@ plan change) — don't let it go stale.
 /cmd/governorctl    - CLI/TUI (bubbletea) for setup, budget caps, live usage
 /cmd/mockprovider   - fake SSE-streaming LLM server, zero API cost, used for all dev/testing
 /internal/proxy     - forwards requests to a provider, streams response, meters cost live
-/internal/budget    - atomic reserve/decrement of spend caps (Redis-backed), pre-flight checks
+/internal/budget    - atomic reserve/decrement of spend caps (in-memory default, Redis-backed optional), pre-flight checks
 /internal/provider  - Provider interface + adapters (mock, OpenAI, Anthropic, ...)
 /internal/ledger    - durable reconciled cost records (Postgres), source of truth post-stream
 ```
@@ -164,3 +164,25 @@ first-time friction, so don't expect tight day-for-day precision here.*
   standalone, tested package), add the `docker-compose.yml` for real
   Redis + Postgres, and decide the reservation key scheme (per API key?
   per project?) once auth exists.
+- Caught a positioning contradiction before it shipped: the original
+  pitch (README/first LinkedIn post) says Governor avoids the
+  proxy+Postgres+Redis hassle of LiteLLM/Helicone-style tools, but the
+  budget store as built only had a Redis-backed implementation — a solo
+  dev running one process would've needed Redis just to enforce their own
+  cap. Fixed by extracting a `Store` interface
+  (`internal/budget/budget.go`) with two implementations instead of
+  retracting the pitch: `MemoryStore` (`internal/budget/memory.go`) is
+  now the default — a mutex-guarded per-key counter, same atomicity
+  guarantee as the Redis Lua script but with no network hop, since a
+  single process only needs to serialize against itself. The Redis
+  version moved to `RedisStore` (`internal/budget/redis.go`, same
+  `NewRedisStore` constructor as before, just renamed) and is now opt-in,
+  for the case `MemoryStore` genuinely can't cover: multiple Governor
+  processes that need to agree on one shared running total, or a cap that
+  survives a restart. `budget_test.go` now runs every correctness test
+  (allow-under-cap, deny-over-cap, the 200-goroutine concurrency proof)
+  against both backends via a table-driven `backends()` helper, so they're
+  held to the same bar. `BenchmarkReserve` shows why this was worth doing
+  beyond the pitch: `MemoryStore` is ~25ns/op vs. `RedisStore`'s ~95µs/op,
+  roughly 3,700x — the network hop was real, avoidable cost for the
+  common single-process case.

@@ -30,15 +30,25 @@ atomic, race-safe enforcement of a spend cap.
 
 ### What works right now
 
-[`internal/budget`](internal/budget) enforces a per-key spend cap against
-Redis with a single atomic operation — the check-and-commit runs as one Lua
-script inside Redis (`EVAL`), not a client-side read-then-write, so it's
-immune to the race where two concurrent requests both read the same
-"current spend" and both get allowed through. It's also O(1): one fixed
-Redis round trip per request, regardless of how much spend history exists.
+[`internal/budget`](internal/budget) enforces a per-key spend cap behind a
+small `Store` interface with two backends:
+
+- **`MemoryStore`** (the default) — a mutex-guarded counter in the
+  process's own memory. A single Governor instance needs nothing more
+  than this to enforce its own cap correctly, so the common case — one
+  binary, one process — pulls in zero external infrastructure.
+- **`RedisStore`** (opt-in) — the same guarantee across multiple
+  processes. The check-and-commit runs as one Lua script inside Redis
+  (`EVAL`) instead of a client-side read-then-write, so it's immune to
+  the race where two concurrent requests on two different instances both
+  read the same "current spend" and both get allowed through. Reach for
+  this only once you're running more than one Governor replica, or need
+  the cap to survive a restart.
+
+Both are O(1): the check doesn't get slower as spend history grows.
 
 ```go
-store := budget.New(redisClient)
+store := budget.NewMemoryStore() // or budget.NewRedisStore(redisClient)
 
 res, err := store.Reserve(ctx, apiKey, estimatedCostMicros, capMicros)
 if !res.Allowed {
@@ -47,17 +57,18 @@ if !res.Allowed {
 }
 ```
 
-Proven with a concurrency test, not just a manual check: 200 goroutines
-fire simultaneous reservations against a $1.00 cap in $0.05 increments, and
-exactly 20 are allowed — verified under `go test -race`.
+Proven with a concurrency test against both backends, not just a manual
+check: 200 goroutines fire simultaneous reservations against a $1.00 cap
+in $0.05 increments, and exactly 20 are allowed — verified under
+`go test -race`.
 
 ```
 go test ./internal/budget/... -v -race
 ```
 
-No Docker or local Redis required to run that — tests use an in-process
-Redis-protocol emulator, so the whole suite runs on a fresh clone with just
-Go installed.
+No Docker or local Redis required to run that — the Redis-backed tests use
+an in-process Redis-protocol emulator, so the whole suite runs on a fresh
+clone with just Go installed.
 
 ## Project layout
 
@@ -66,7 +77,7 @@ Go installed.
 /cmd/governorctl    - CLI/TUI (bubbletea) for setup, budget caps, live usage
 /cmd/mockprovider   - fake SSE-streaming LLM server, zero API cost, used for all dev/testing
 /internal/proxy     - forwards requests to a provider, streams response, meters cost live
-/internal/budget    - atomic reserve/decrement of spend caps (Redis-backed), pre-flight checks
+/internal/budget    - atomic reserve/decrement of spend caps (in-memory default, Redis-backed optional), pre-flight checks
 /internal/provider  - Provider interface + adapters (mock, OpenAI, Anthropic, ...)
 /internal/ledger    - durable reconciled cost records (Postgres), source of truth post-stream
 ```
