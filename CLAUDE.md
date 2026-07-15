@@ -127,3 +127,40 @@ first-time friction, so don't expect tight day-for-day precision here.*
 - Connected the local repo to `git@github.com:hadi-moustafa/Governor.git`
   (SSH — an existing ed25519 key on this machine was already authorized
   with the `hadi-moustafa` GitHub account) and pushed `master` upstream.
+
+### 2026-07-15
+- Implemented the core of the Phase 1 budget store (`internal/budget`):
+  atomic reserve/decrement of a per-key spend cap, backed by Redis. The
+  design question driving this: how to enforce a hard cap the instant a
+  request would cross it, without adding latency to every call before it.
+  Answer landed on: do the check-and-increment as a single Lua script
+  (`EVAL`) executed inside Redis, not a client-side GET-then-SET. That
+  makes it one fixed-cost round trip per request (O(1) regardless of how
+  much spend history exists — no scan, no lock contention on the client),
+  and it's atomic because Redis serializes script execution, so two
+  concurrent requests racing for the last bit of budget can't both read
+  the same "current" value and both get allowed through. Amounts are
+  tracked in micros (int64) to keep money out of floating point.
+  `Store.Reserve(ctx, key, amountMicros, capMicros)` returns
+  `Result{Allowed, SpentMicros}`; a denied reservation must never reach a
+  provider. `Store.Refund` decrements the tally, for truing up an
+  over-estimated reservation after actual usage is known (mid-stream
+  cutoff, reconciliation).
+- Added dependencies: `github.com/redis/go-redis/v9` (client) and
+  `github.com/alicebob/miniredis/v2` (in-process Redis emulator with Lua
+  support, dev-only — used in tests so the budget package is exercisable
+  without standing up real Redis; this machine doesn't have docker group
+  membership yet, so real Redis via `docker compose` is still untried —
+  revisit once that's sorted).
+- Test coverage for the atomicity claim: `TestReserve_ConcurrentNoDoubleSpend`
+  fires 200 goroutines at a $1.00 cap in $0.05 increments and asserts
+  exactly 20 are allowed — passes under `go test -race`. `BenchmarkReserve`
+  confirms the check costs a flat ~95µs/op (in-process Redis emulator)
+  with no growth as call count increases. `Example` in
+  `internal/budget/example_test.go` is a runnable, `go test`-verified demo
+  of the cutoff behavior end-to-end.
+- Still open before this is genuinely Phase-1-done: wire `Reserve` into
+  `cmd/governor`'s request path (it currently only exists as a
+  standalone, tested package), add the `docker-compose.yml` for real
+  Redis + Postgres, and decide the reservation key scheme (per API key?
+  per project?) once auth exists.
