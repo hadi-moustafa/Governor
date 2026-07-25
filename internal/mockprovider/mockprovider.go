@@ -25,6 +25,24 @@ type Config struct {
 	Chunks         int
 	TokensPerChunk int
 	ChunkDelay     time.Duration
+
+	// SummaryOnly, if true, reports tokens:0 on every chunk except the
+	// last, which carries the full cumulative total — mirroring providers
+	// (e.g. OpenAI's stream_options.include_usage) that only report usage
+	// once a stream finishes, rather than incrementally per chunk.
+	SummaryOnly bool
+
+	// FailAfterChunk, if nonzero, stops after writing that many chunks and
+	// emits a wire-level error event instead of continuing to [DONE] —
+	// mirroring a provider that reports errors as a distinct payload shape
+	// rather than tearing down the connection.
+	FailAfterChunk int
+
+	// FailImmediately, if true, emits a wire-level error event before
+	// writing any chunk at all — a provider that fails before streaming
+	// any real content. Distinct from FailAfterChunk so 0 can stay a
+	// normal "don't fail" default for that field.
+	FailImmediately bool
 }
 
 // Stats is what a Server observed while handling its request.
@@ -67,6 +85,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 
+	if s.cfg.FailImmediately {
+		fmt.Fprint(w, `data: {"error":{"type":"rate_limited","message":"mockprovider: simulated immediate upstream failure"}}`+"\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		s.finish(start, false)
+		return
+	}
+
 	ctx := r.Context()
 	for i := 0; i < s.cfg.Chunks; i++ {
 		select {
@@ -76,7 +103,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-time.After(s.cfg.ChunkDelay):
 		}
 
-		fmt.Fprintf(w, "data: {\"delta\":\"chunk-%d\",\"tokens\":%d,\"finish_reason\":\"\"}\n\n", i, s.cfg.TokensPerChunk)
+		if s.cfg.FailAfterChunk != 0 && i == s.cfg.FailAfterChunk {
+			fmt.Fprint(w, `data: {"error":{"type":"rate_limited","message":"mockprovider: simulated upstream failure"}}`+"\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			s.finish(start, false)
+			return
+		}
+
+		tokens := s.cfg.TokensPerChunk
+		if s.cfg.SummaryOnly {
+			if i < s.cfg.Chunks-1 {
+				tokens = 0
+			} else {
+				tokens = s.cfg.TokensPerChunk * s.cfg.Chunks // cumulative total, reported only now
+			}
+		}
+		fmt.Fprintf(w, "data: {\"delta\":\"chunk-%d\",\"tokens\":%d,\"finish_reason\":\"\"}\n\n", i, tokens)
 		if flusher != nil {
 			flusher.Flush()
 		}

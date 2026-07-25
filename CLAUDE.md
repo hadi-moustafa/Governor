@@ -269,3 +269,114 @@ first-time friction, so don't expect tight day-for-day precision here.*
   Provider-adapter item wasn't built in this step; pricing is one flat
   rate with no input/output split; `budget.Store.Refund` stays unexercised
   outside its own package until reconciliation exists.
+
+### 2026-07-25
+- Closed out the four items the previous entries flagged as still open,
+  finishing Phase 1's remaining scope.
+- Budget reservation key: replaced the hardcoded `placeholderKey =
+  "default"` with `reservationKey(r)` (`internal/proxy/proxy.go`), which
+  reads an `X-Governor-Key` request header and falls back to `"default"`
+  when absent. No auth, no validation — real auth is still a Phase 2 item
+  — this just makes the key a real per-request input instead of a
+  constant. Resolved once in `ServeHTTP` and threaded through
+  `runStream` as a parameter (not re-read from the header a second time)
+  so preflight, per-chunk metering, and reconciliation all agree on the
+  same key for a given request.
+- `docker-compose.yml` added at the repo root (Redis 7 + Postgres 16,
+  minimal, no healthchecks/Makefile). Docker group membership and the
+  `docker compose` plugin (not preinstalled — Fedora's base repos don't
+  carry `docker-compose-plugin`; installed via `sudo dnf install
+  docker-compose`) both needed a human in an interactive terminal (sudo
+  password, then a KDE session logout/login for the new group to take —
+  a fresh terminal alone wasn't enough, since supplementary groups are
+  fixed at session login, not per-shell). Both containers are up
+  (`docker compose ps` shows `redis`/`postgres` running). Added
+  `internal/budget/redis_integration_test.go`
+  (`TestRedisStore_AgainstRealRedis`), skipped unless
+  `GOVERNOR_TEST_REDIS_ADDR` is set so `go test ./...` never requires
+  Docker — re-runs the 200-goroutine/$1.00-cap concurrency proof against
+  real Redis instead of miniredis. Ran it
+  (`GOVERNOR_TEST_REDIS_ADDR=localhost:6379 go test
+  ./internal/budget/... -race`): passes, exactly 20 of 200 concurrent
+  reservations allowed — closes the "never actually tried against real
+  Redis" gap flagged in the prior entries.
+- Second fake provider: `internal/provider/mockfinal` (client) plus two
+  new `internal/mockprovider.Config` fields (`SummaryOnly`,
+  `FailAfterChunk`/`FailImmediately`) it talks to, deliberately diverging
+  from `internal/provider/mock` on two axes — chosen because they're
+  real quirks Phase 2's OpenAI/Anthropic adapters will actually hit, not
+  invented ones:
+  - `SummaryOnly` reports `tokens:0` on every chunk except the last,
+    which carries the full cumulative total (OpenAI's
+    `stream_options.include_usage` shape). This is the valuable finding
+    from building it: `internal/proxy/stream.go` reserves budget
+    per-chunk using each chunk's own `Tokens` value, so a provider shaped
+    like this makes live mid-stream cutoff structurally impossible — cost
+    isn't knowable until the stream is already over. Proved, not
+    papered over, by `TestServeHTTP_SummaryOnlyProviderCannotBeCutMidStream`:
+    a cap sized to reliably trip `TestServeHTTP_CutoffCancelsUpstream`
+    mid-stream against the normal mock instead only denies the *last*
+    chunk here, after everything ahead of it already reached the client.
+    This is a real gap to hand into Phase 2's OpenAI adapter work, not
+    something fixed in this pass.
+  - `FailAfterChunk`/`FailImmediately` emit a wire-level `{"error":...}`
+    payload instead of tearing down the connection, decoded by
+    `mockfinal.Client` into a typed `*mockfinal.ProviderError` rather
+    than an opaque transport error — testing whether
+    `provider.Stream.Next() (Chunk, error)`'s bare `error` return is
+    expressive enough for a real provider's distinct error shape (it
+    was, no interface change needed, but it's now proven rather than
+    assumed).
+- Reconciliation worker + `internal/ledger`: built out the empty stub
+  into a `Store` interface (`Record`) with a `MemoryStore` (default,
+  mirroring `budget`'s Memory/Redis split) and a `PostgresStore`
+  (`internal/ledger/postgres.go`, `jackc/pgx/v5`/`pgxpool`, added once
+  `go get github.com/jackc/pgx/v5` was run from a machine with real
+  network access — this sandbox has none). `NewPostgresStore(ctx, dsn)`
+  runs a `CREATE TABLE IF NOT EXISTS ledger_records ...` itself, no
+  migration framework, same "just enough" story as everywhere else in
+  this codebase. Added
+  `internal/ledger/postgres_integration_test.go`
+  (`TestPostgresStore_AgainstRealPostgres`), skipped unless
+  `GOVERNOR_TEST_POSTGRES_DSN` is set, mirroring the
+  `GOVERNOR_TEST_REDIS_ADDR` pattern in `internal/budget`. Ran it against
+  the `docker-compose.yml` postgres service and confirmed via `psql`
+  that the row actually landed — `PostgresStore` is proven, not just
+  compiling.
+  - `proxy.Handler` gained a `Ledger ledger.Store` field (nil-safe —
+    reconciliation is skipped if unset) and `runStream` now calls a new
+    `h.reconcile(...)` on every exit path (normal EOF, provider error,
+    and the budget-denied cutoff), synchronously and in-request rather
+    than backgrounded, specifically to avoid introducing a second class
+    of race alongside the budget-store concurrency proofs.
+  - Scope decision on what "estimated vs. actual" means here, since the
+    current architecture bills each forwarded chunk at exactly its real
+    cost the moment it's known (no drift possible there by construction):
+    reconciliation compares the speculative preflight reservation against
+    real content delivered. If at least one chunk streamed, estimated
+    equals actual (no drift, nothing to refund — this is what
+    `TestServeHTTP_ReconciliationNoDriftOnNormalCompletion` pins down).
+    If zero chunks ever streamed (upstream errors before any content —
+    exercised via the new `mockprovider.Config.FailImmediately`), the
+    entire preflight reservation bought nothing and is refunded via
+    `budget.Store.Refund`, exercising it for the first time outside its
+    own package's tests
+    (`TestServeHTTP_ReconciliationRefundsWastedPreflightOnImmediateFailure`).
+    Modeling finer-grained drift (e.g. the one real-but-unbilled chunk
+    that trips a mid-stream cutoff) was deliberately left out — it would
+    need semantics not yet decided, and this scope already fixes the
+    concrete gap Refund existed to close.
+  - `cmd/governor/main.go` wires `ledger.NewMemoryStore()` in by default.
+- `go build ./...`, `go vet ./...`, and `go test -race -count=3 ./...`
+  all clean across every package, including the four new/changed ones
+  (`internal/ledger`, `internal/provider/mockfinal`, plus the extended
+  `internal/mockprovider` and `internal/proxy` suites).
+- All four items from the prior entries' open list are now closed: key
+  scheme, docker-compose + real-Redis verification, second fake
+  provider, and reconciliation/ledger (both Memory and Postgres
+  backends, both proven against real infra). Phase 1 is genuinely done.
+  Remaining item going into Phase 2: the `SummaryOnly`-provider
+  mid-stream cutoff gap now has a name and a regression test but no fix
+  — the OpenAI adapter will need either a client-side per-chunk token
+  estimator or an explicit acceptance that OpenAI streams only get
+  preflight-level cap protection.

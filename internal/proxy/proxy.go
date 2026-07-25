@@ -9,13 +9,30 @@ import (
 	"net/http"
 
 	"github.com/hadi-moustafa/governor/internal/budget"
+	"github.com/hadi-moustafa/governor/internal/ledger"
 	"github.com/hadi-moustafa/governor/internal/pricing"
 	"github.com/hadi-moustafa/governor/internal/provider"
 )
 
-// placeholderKey is the budget reservation key used until a real
-// reservation key scheme exists tied to auth (still open — see CLAUDE.md).
-const placeholderKey = "default"
+// keyHeader names the request header clients use to identify themselves for
+// budget tracking. There's no auth yet (still open — see CLAUDE.md), so this
+// isn't validated or trusted for anything beyond bucketing spend; it just
+// turns the reservation key into a real input instead of a constant.
+const keyHeader = "X-Governor-Key"
+
+// defaultKey is the reservation key used when keyHeader is absent.
+const defaultKey = "default"
+
+// reservationKey resolves the budget reservation key for r. Callers should
+// resolve it once per request and thread the same value through preflight,
+// per-chunk metering, and reconciliation, rather than re-reading the header
+// at each step.
+func reservationKey(r *http.Request) string {
+	if k := r.Header.Get(keyHeader); k != "" {
+		return k
+	}
+	return defaultKey
+}
 
 // Handler forwards decoded requests to Provider, metering cost against
 // Store as chunks arrive.
@@ -23,8 +40,14 @@ type Handler struct {
 	Provider provider.Provider
 	Store    budget.Store
 	Pricing  pricing.Model
+	// Ledger records estimated-vs-actual cost once a stream ends, and is
+	// where any over-reservation gets refunded back to Store. Optional —
+	// if nil, reconciliation is skipped (useful for tests that don't care
+	// about it).
+	Ledger ledger.Store
 
-	// CapMicros is the hard spend cap for placeholderKey.
+	// CapMicros is the hard spend cap for a request's reservation key
+	// (see reservationKey).
 	CapMicros int64
 	// PreflightTokens is a crude fixed estimate reserved before the
 	// provider is called at all, standing in for a real prompt tokenizer.
@@ -40,7 +63,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pre, err := h.Store.Reserve(r.Context(), placeholderKey, h.Pricing.CostMicros(h.PreflightTokens), h.CapMicros)
+	key := reservationKey(r)
+	preflightMicros := h.Pricing.CostMicros(h.PreflightTokens)
+
+	pre, err := h.Store.Reserve(r.Context(), key, preflightMicros, h.CapMicros)
 	if err != nil {
 		http.Error(w, "budget check failed", http.StatusInternalServerError)
 		return
@@ -51,5 +77,5 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.runStream(w, r, req)
+	h.runStream(w, r, req, key, preflightMicros)
 }

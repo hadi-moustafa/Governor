@@ -10,6 +10,7 @@ import (
 	"net/http"
 
 	"github.com/hadi-moustafa/governor/internal/budget"
+	"github.com/hadi-moustafa/governor/internal/ledger"
 	"github.com/hadi-moustafa/governor/internal/pricing"
 	"github.com/hadi-moustafa/governor/internal/provider/mock"
 	"github.com/hadi-moustafa/governor/internal/proxy"
@@ -26,6 +27,7 @@ func main() {
 		Provider:        mock.New(*providerURL),
 		Store:           budget.NewMemoryStore(),
 		Pricing:         pricing.Model{MicrosPerToken: *microsPerToken},
+		Ledger:          ledger.NewMemoryStore(),
 		CapMicros:       int64(*capDollars * 1_000_000),
 		PreflightTokens: 1,
 	}
