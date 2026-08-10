@@ -1,5 +1,16 @@
 package main
 
+import (
+	"fmt"
+	"os"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
 func main() {
-	// TODO(phase 2): bubbletea TUI for setup, budget caps, live usage/ledger, daemon start/stop.
+	p := tea.NewProgram(initialModel())
+	if _, err := p.Run(); err != nil {
+		fmt.Fprintln(os.Stderr, "governorctl:", err)
+		os.Exit(1)
+	}
 }
