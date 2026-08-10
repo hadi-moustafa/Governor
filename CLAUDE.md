@@ -649,7 +649,24 @@ first-time friction, so don't expect tight day-for-day precision here.*
   explicit callout of the OpenAI mid-stream-cutoff limitation with
   links to the code that proves it.
 - `LICENSE`: MIT, matching the README's existing "planned MIT" note.
+- Pushed everything (`3ef4a3e`..`7255925`) and watched the first real
+  CI run via `gh run watch` — it's what CI is for, catching something
+  no amount of local review would have: the `lint` job failed with
+  `the Go language version (go1.24) used to build golangci-lint is
+  lower than the targeted Go version`. Confirmed via `go mod tidy`
+  that dependencies already require go1.25 minimum (it bumped
+  `go.mod` from the exact-local-toolchain `1.26.5` down to the real
+  computed minimum `1.25.0` on its own) — meaning there's no `go.mod`
+  directive that's simultaneously accurate and low enough for
+  golangci-lint's current release to analyze. Genuine upstream lag,
+  not a config mistake on this end. Fixed by keeping the corrected
+  `1.25.0` directive and dropping the `lint` job rather than leave a
+  permanently-red one; `gofmt`/`go vet` in the `test` job remain the
+  real static-analysis gate until golangci-lint ships a build
+  compiled with go1.25+. Pushed the fix (`5400a4a`) and watched CI go
+  fully green.
 - Still open: hosted deploy (deferred, needs user's host/domain
-  decision); real verification of CI and goreleaser (both need this
-  work pushed and, for goreleaser, a tagged release or network access
-  this sandbox doesn't have).
+  decision — real money, not something to decide unilaterally);
+  goreleaser is still unverified — it needs network access this
+  sandbox doesn't have to install, and there's no tagged release yet
+  to run it against.
