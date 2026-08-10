@@ -25,6 +25,10 @@ func (h *Handler) runStream(w http.ResponseWriter, r *http.Request, req provider
 
 	s, err := h.Provider.Send(ctx, req)
 	if err != nil {
+		if h.Metrics != nil {
+			h.Metrics.StreamsErrored.Add(1)
+		}
+		h.logger().Warn("provider_send_failed", "key", key, "model", req.Model, "error", err)
 		http.Error(w, fmt.Sprintf("provider error: %v", err), http.StatusBadGateway)
 		h.reconcile(key, preflightMicros, 0, "provider_error")
 		return
@@ -46,12 +50,18 @@ func (h *Handler) runStream(w http.ResponseWriter, r *http.Request, req provider
 			finishReason := "stop"
 			if !errors.Is(err, io.EOF) {
 				finishReason = "provider_error"
+				if h.Metrics != nil {
+					h.Metrics.StreamsErrored.Add(1)
+				}
+				h.logger().Warn("stream_error", "key", key, "model", req.Model, "error", err)
+			} else if h.Metrics != nil {
+				h.Metrics.StreamsCompleted.Add(1)
 			}
 			h.reconcile(key, preflightMicros, contentMicros, finishReason)
 			return
 		}
 
-		cost := h.Pricing.CostMicros(chunk.Tokens)
+		cost := h.Pricing.CostMicros(req.Model, chunk.Tokens)
 		res, err := h.Store.Reserve(ctx, key, cost, h.CapMicros)
 		if err != nil {
 			h.reconcile(key, preflightMicros, contentMicros, "reserve_error")
@@ -67,6 +77,16 @@ func (h *Handler) runStream(w http.ResponseWriter, r *http.Request, req provider
 			// reach a provider.
 			cancel()
 			writeChunk(w, flusher, provider.Chunk{FinishReason: "budget_exceeded"})
+			if h.Metrics != nil {
+				h.Metrics.MidStreamCutoffs.Add(1)
+			}
+			h.logger().Warn("budget_mid_stream_cutoff",
+				"key", key,
+				"model", req.Model,
+				"cap_micros", h.CapMicros,
+				"content_micros", contentMicros,
+				"denied_chunk_cost_micros", cost,
+			)
 			h.reconcile(key, preflightMicros, contentMicros, "budget_exceeded")
 			return
 		}
@@ -115,8 +135,23 @@ func (h *Handler) reconcile(key string, preflightMicros, contentMicros int64, fi
 		FinishReason:    finishReason,
 		RecordedAt:      time.Now(),
 	})
+	if h.Metrics != nil {
+		h.Metrics.Reconciliations.Add(1)
+	}
+
 	if refundMicros > 0 {
 		_ = h.Store.Refund(ctx, key, refundMicros)
+		if h.Metrics != nil {
+			h.Metrics.RefundsIssued.Add(1)
+			h.Metrics.DriftMicrosTotal.Add(refundMicros)
+		}
+		h.logger().Info("reconciled",
+			"key", key,
+			"finish_reason", finishReason,
+			"estimated_micros", estimatedMicros,
+			"actual_micros", actualMicros,
+			"refund_micros", refundMicros,
+		)
 	}
 }
 

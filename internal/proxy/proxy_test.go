@@ -9,6 +9,7 @@ import (
 
 	"github.com/hadi-moustafa/governor/internal/budget"
 	"github.com/hadi-moustafa/governor/internal/ledger"
+	"github.com/hadi-moustafa/governor/internal/metrics"
 	"github.com/hadi-moustafa/governor/internal/mockprovider"
 	"github.com/hadi-moustafa/governor/internal/pricing"
 	"github.com/hadi-moustafa/governor/internal/provider/mock"
@@ -373,5 +374,91 @@ func TestServeHTTP_ReconciliationRefundsWastedPreflightOnImmediateFailure(t *tes
 	}
 	if !res.Allowed {
 		t.Fatalf("expected the full cap to be reservable after the preflight was refunded, got SpentMicros=%d", res.SpentMicros)
+	}
+}
+
+// TestServeHTTP_MetricsCountPreflightDenialAndCutoff proves the metrics
+// counters that matter most for a spend-control gateway actually
+// increment at the two decision points they exist to observe: a request
+// denied before ever reaching a provider, and a stream cut off mid-flight.
+func TestServeHTTP_MetricsCountPreflightDenialAndCutoff(t *testing.T) {
+	m := &metrics.Counters{}
+
+	t.Run("preflight denial", func(t *testing.T) {
+		mp := mockprovider.NewServer(mockprovider.Config{Chunks: 5, TokensPerChunk: 10, ChunkDelay: time.Millisecond})
+		upstream := httptest.NewServer(mp)
+		defer upstream.Close()
+
+		h := &proxy.Handler{
+			Provider:        mock.New(upstream.URL),
+			Store:           budget.NewMemoryStore(),
+			Pricing:         pricing.Model{MicrosPerToken: 1000},
+			Metrics:         m,
+			CapMicros:       500, // less than the preflight reservation itself
+			PreflightTokens: 1,
+		}
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/", strings.NewReader(reqJSON)))
+
+		if got := m.Snapshot().PreflightDenials; got != 1 {
+			t.Fatalf("PreflightDenials = %d, want 1", got)
+		}
+	})
+
+	t.Run("mid-stream cutoff", func(t *testing.T) {
+		mp := mockprovider.NewServer(mockprovider.Config{Chunks: 30, TokensPerChunk: 10, ChunkDelay: 15 * time.Millisecond})
+		upstream := httptest.NewServer(mp)
+		defer upstream.Close()
+
+		h := &proxy.Handler{
+			Provider:        mock.New(upstream.URL),
+			Store:           budget.NewMemoryStore(),
+			Pricing:         pricing.Model{MicrosPerToken: 1000},
+			Metrics:         m,
+			CapMicros:       51_000,
+			PreflightTokens: 1,
+		}
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/", strings.NewReader(reqJSON)))
+
+		if got := m.Snapshot().MidStreamCutoffs; got != 1 {
+			t.Fatalf("MidStreamCutoffs = %d, want 1", got)
+		}
+	})
+}
+
+// TestServeHTTP_MetricsCountReconciliationRefund proves DriftMicrosTotal
+// and RefundsIssued increment exactly when reconcile actually refunds
+// something — the immediate-failure case, same scenario as
+// TestServeHTTP_ReconciliationRefundsWastedPreflightOnImmediateFailure.
+func TestServeHTTP_MetricsCountReconciliationRefund(t *testing.T) {
+	mp := mockprovider.NewServer(mockprovider.Config{
+		Chunks:          10,
+		TokensPerChunk:  10,
+		ChunkDelay:      time.Millisecond,
+		FailImmediately: true,
+	})
+	upstream := httptest.NewServer(mp)
+	defer upstream.Close()
+
+	m := &metrics.Counters{}
+	h := &proxy.Handler{
+		Provider:        mockfinal.New(upstream.URL),
+		Store:           budget.NewMemoryStore(),
+		Ledger:          ledger.NewMemoryStore(),
+		Metrics:         m,
+		Pricing:         pricing.Model{MicrosPerToken: 1000},
+		CapMicros:       1_000_000,
+		PreflightTokens: 1,
+	}
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("POST", "/", strings.NewReader(reqJSON)))
+
+	snap := m.Snapshot()
+	if snap.Reconciliations != 1 {
+		t.Fatalf("Reconciliations = %d, want 1", snap.Reconciliations)
+	}
+	if snap.RefundsIssued != 1 {
+		t.Fatalf("RefundsIssued = %d, want 1", snap.RefundsIssued)
+	}
+	if snap.DriftMicrosTotal != 1000 {
+		t.Fatalf("DriftMicrosTotal = %d, want 1000 (the wasted preflight reservation)", snap.DriftMicrosTotal)
 	}
 }

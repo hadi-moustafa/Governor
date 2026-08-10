@@ -6,10 +6,12 @@ package proxy
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/hadi-moustafa/governor/internal/budget"
 	"github.com/hadi-moustafa/governor/internal/ledger"
+	"github.com/hadi-moustafa/governor/internal/metrics"
 	"github.com/hadi-moustafa/governor/internal/pricing"
 	"github.com/hadi-moustafa/governor/internal/provider"
 )
@@ -39,12 +41,19 @@ func reservationKey(r *http.Request) string {
 type Handler struct {
 	Provider provider.Provider
 	Store    budget.Store
-	Pricing  pricing.Model
+	Pricing  pricing.Pricer
 	// Ledger records estimated-vs-actual cost once a stream ends, and is
 	// where any over-reservation gets refunded back to Store. Optional —
 	// if nil, reconciliation is skipped (useful for tests that don't care
 	// about it).
 	Ledger ledger.Store
+	// Metrics counts budget rejections, cutoffs, and reconciliation
+	// drift. Optional — if nil, counting is skipped.
+	Metrics *metrics.Counters
+	// Logger receives structured events for the same three decision
+	// points Metrics counts. Optional — defaults to slog.Default() if
+	// nil, so callers get reasonable output for free.
+	Logger *slog.Logger
 
 	// CapMicros is the hard spend cap for a request's reservation key
 	// (see reservationKey).
@@ -56,6 +65,13 @@ type Handler struct {
 
 var _ http.Handler = (*Handler)(nil)
 
+func (h *Handler) logger() *slog.Logger {
+	if h.Logger != nil {
+		return h.Logger
+	}
+	return slog.Default()
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req provider.Request
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -64,7 +80,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	key := reservationKey(r)
-	preflightMicros := h.Pricing.CostMicros(h.PreflightTokens)
+	preflightMicros := h.Pricing.CostMicros(req.Model, h.PreflightTokens)
 
 	pre, err := h.Store.Reserve(r.Context(), key, preflightMicros, h.CapMicros)
 	if err != nil {
@@ -73,6 +89,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if !pre.Allowed {
 		// Denied before ever reaching the provider — no tokens bought.
+		if h.Metrics != nil {
+			h.Metrics.PreflightDenials.Add(1)
+		}
+		h.logger().Warn("budget_preflight_denied",
+			"key", key,
+			"model", req.Model,
+			"cap_micros", h.CapMicros,
+			"spent_micros", pre.SpentMicros,
+			"preflight_micros", preflightMicros,
+		)
 		http.Error(w, "budget exceeded", http.StatusTooManyRequests)
 		return
 	}
