@@ -380,3 +380,212 @@ first-time friction, so don't expect tight day-for-day precision here.*
   — the OpenAI adapter will need either a client-side per-chunk token
   estimator or an explicit acceptance that OpenAI streams only get
   preflight-level cap protection.
+
+### 2026-08-10
+- Started Phase 2. Sectioned it into 7 steps: (1) OpenAI adapter, (2)
+  Anthropic adapter, (3) real per-model pricing table, (4) config
+  loading, (5) observability, (6) library packaging, (7) TUI. Neither
+  an OpenAI nor an Anthropic API key/credit is available yet, so real
+  providers will be built and unit-tested against their documented wire
+  formats (same `httptest`-mocked style as `internal/provider/mock` and
+  `mockfinal` — no live calls), with live verification deferred until
+  keys exist. Reordered config loading ahead of the provider adapters
+  since the adapters need it to read API keys from the environment.
+- Built `internal/config`: a `Config` struct plus `Load()`, env-var-only
+  for now (`GOVERNOR_`-prefixed vars — addr, provider selection, both
+  API keys, cap, preflight tokens, flat-rate price stub,
+  `GOVERNOR_REDIS_ADDR`/`GOVERNOR_POSTGRES_DSN`). No config file yet —
+  deliberately deferred until something other than local/CLI use
+  actually needs one; the struct is the seam a file loader could fill in
+  later without reshaping callers. Malformed numeric env vars return a
+  typed `*config.ParseError` rather than silently falling back to a
+  default.
+- `cmd/governor/main.go` now calls `config.Load()` first; env vars (or
+  the zero-config local-dev defaults) supply each flag's default, so
+  flags still override at invocation but `governor` with zero flags and
+  zero env vars keeps working exactly as before, against the mock
+  provider. Also actually wired `budget.NewRedisStore` and
+  `ledger.NewPostgresStore` into `main.go` behind `GOVERNOR_REDIS_ADDR`/
+  `GOVERNOR_POSTGRES_DSN` — both backends existed and were tested
+  already but were never reachable from the real binary, only from
+  tests.
+- Verified: `go build`/`go vet`/`go test -race ./...` clean; manually
+  ran `go run ./cmd/governor -addr :18080` with no env vars set and
+  confirmed via `ss -ltnp` it bound the port and logged the expected
+  zero-config defaults (mock provider, $1.00 cap).
+- Built the OpenAI adapter (`internal/provider/openai`): real
+  `Authorization: Bearer` auth, real request shape
+  (`stream:true,stream_options:{include_usage:true}`), and — this is the
+  interesting result — real confirmation of the `mockfinal.SummaryOnly`
+  finding from the Phase 1 closeout: OpenAI's actual streaming format
+  really does report `tokens:0` on every content chunk and the true
+  cumulative `usage.total_tokens` only once, on a final chunk with an
+  empty `choices` array, right before `[DONE]`. That wasn't a guess
+  baked into the mock — it's what the real API does. Request-level
+  failures (bad key, rate limit) surface as a typed `*openai.APIError`
+  decoded from the JSON error body. Built and unit-tested against an
+  `httptest` server emulating this exact wire format — no live key
+  available yet, so nothing has hit the real API.
+- Built the Anthropic adapter (`internal/provider/anthropic`): real
+  `x-api-key`/`anthropic-version` auth, and the Messages API's own
+  quirks preserved rather than smoothed over — a `system`-role message
+  must be pulled out of the `messages` array into a separate top-level
+  field (`splitSystem`), and the stream is a sequence of named SSE
+  events (`message_start`, `content_block_delta`, `message_delta`,
+  `message_stop`, periodic `ping`s) self-described by a `"type"` field
+  in each payload, not a flat one-event-per-chunk stream terminated by
+  a literal sentinel — most events carry nothing `provider.Chunk` cares
+  about and are skipped in `Next`. Confirms the *other* half of the
+  Phase 1 finding: `message_delta` carries the real output-token count
+  incrementally, mid-stream, not just at the very end — so live
+  per-chunk budget cutoff should actually work against Anthropic,
+  unlike OpenAI. One known gap flagged in code, not silently papered
+  over: Anthropic requires `max_tokens` on every request but
+  `provider.Request` has no field for it yet, so this adapter sends a
+  fixed `defaultMaxTokens = 1024` — revisit if/when `Request` grows a
+  real field for it. Also unit-tested only, no live key yet.
+- Wired both into `cmd/governor/main.go` behind `cfg.Provider`
+  (`"mock"`/`"openai"`/`"anthropic"`, read from `GOVERNOR_PROVIDER`),
+  each new provider requiring its matching API key env var or failing
+  fast at startup with a clear message rather than a nil-pointer panic
+  later.
+- `go build`/`go vet`/`go test -race ./...` clean across every package,
+  including the two new adapter suites.
+- Built the real pricing table (`internal/pricing/table.go`). Kept the
+  flat-rate `Model` from Phase 1 working exactly as before rather than
+  ripping it out — most existing tests depend on its predictable
+  arithmetic, and the mock provider's fake token counts don't map to
+  any real model anyway, so a per-model table has nothing meaningful to
+  price there. Introduced a `Pricer` interface
+  (`CostMicros(model string, tokens int) int64`) both `Model` and the
+  new `Table` satisfy, widened `proxy.Handler.Pricing` from the
+  concrete `pricing.Model` to `pricing.Pricer`, and threaded `req.Model`
+  through the two existing call sites
+  (`internal/proxy/proxy.go`/`stream.go`) — a two-line signature change
+  plus swapping a struct field's type, since only those two call sites
+  and no test files called `CostMicros` directly. `Table` is a
+  `map[string]Rates` with a `Fallback` for unrecognized models, plus a
+  dated, versioned snapshot (`pricing.Snapshot20260810`) with
+  illustrative per-output-token rates for a handful of real OpenAI/
+  Anthropic model names. Explicitly documented, not hidden: these are
+  approximate point-in-time figures I can't guarantee are currently
+  accurate (no live pricing API to check against) — verify against each
+  provider's published pricing page before trusting this for real
+  billing, and add a new dated `Snapshot` rather than mutating this one
+  when rates change. Also explicitly out of scope, flagged in
+  `Rates`'s doc comment: this only prices output tokens — neither
+  adapter's `Chunk` currently splits input vs. output per chunk (OpenAI
+  reports a combined total once at the end; Anthropic's incremental
+  `message_delta` is output-only, with input tokens arriving separately
+  in `message_start`, unread by anything today), so real input-token
+  cost still isn't priced by anything beyond the flat `PreflightTokens`
+  guess.
+- `cmd/governor/main.go`: `mock` keeps `pricing.Model`; `openai` and
+  `anthropic` now select `pricing.Snapshot20260810`.
+- `go build`/`go vet`/`go test -race ./...` clean, including the new
+  `internal/pricing` test suite (previously had none).
+- Built observability (`internal/metrics` + `log/slog`, both stdlib —
+  no new dependency, nothing in this project yet needs a real metrics
+  backend to scrape from). `metrics.Counters` is a set of
+  `atomic.Int64` fields (preflight denials, mid-stream cutoffs, streams
+  completed/errored, reconciliations, refunds issued, cumulative
+  drift micros) with a `Snapshot()` and a `metrics.Handler` serving
+  that snapshot as JSON — deliberately not a Prometheus text-exposition
+  handler, just enough to point curl or a debug dashboard at.
+  `proxy.Handler` gained optional `Metrics *metrics.Counters` and
+  `Logger *slog.Logger` fields (the latter defaulting to
+  `slog.Default()` when nil), both wired at exactly the decision
+  points that matter for a spend-control gateway: preflight denial,
+  mid-stream cutoff (logs the cap, content spent so far, and the
+  specific chunk's cost that tripped it), stream errors, and
+  reconciliation (logs and counts only when `reconcile` actually finds
+  drift and issues a refund — the common no-drift case stays quiet by
+  design, so the log isn't noise on every successful stream).
+  `cmd/governor/main.go` wires a `*metrics.Counters` into the handler
+  and serves it at `/debug/metrics`; manually verified end-to-end
+  (`curl localhost:18081/debug/metrics` returned the expected zeroed
+  JSON snapshot on a fresh run).
+- `go build`/`go vet`/`go test -race ./...` clean, including new tests
+  in `internal/metrics` and three new metrics-focused tests in
+  `internal/proxy` that assert counters actually increment at each of
+  those decision points (not just that the fields exist).
+- Packaged Governor as an importable library. Built a new top-level
+  `/gateway` package — deliberately not under `internal/`, since Go's
+  internal-package visibility rule would otherwise block any downstream
+  `go get`'er from importing it at all. `gateway.Config` is a clean
+  public struct (zero value is valid and runs against the mock
+  provider) and `gateway.New(cfg) (*Gateway, error)` does exactly the
+  wiring `cmd/governor/main.go` used to do inline — build the right
+  provider adapter and matching pricer, budget store, ledger store, and
+  metrics counters, mount the resulting `proxy.Handler` plus
+  `/debug/metrics` on an `http.ServeMux`. `Gateway` embeds
+  `http.Handler` and also exposes `Metrics *metrics.Counters` directly
+  (readable via `gw.Metrics.Snapshot()` — no HTTP round trip needed),
+  proven possible despite `metrics.Counters` being an `internal/` type:
+  Go's internal-visibility rule blocks *importing* the package, not
+  calling exported methods on a value you already have, so this is a
+  legal way to hand a caller live counters without leaking the internal
+  import path into their code.
+- Refactored `cmd/governor/main.go` down to a thin CLI/env wrapper
+  around `gateway.New` — this removed the entire provider-selection
+  switch statement and budget/ledger backend selection that used to
+  live inline in `main.go`, rather than duplicating it between the
+  binary and the new library surface. `main()` is now: load env config,
+  parse flags, call `gateway.New`, serve.
+- Added `/example/main.go` — the actual "someone else could `go get`
+  this and use it in ~10 lines" deliverable, not just a claim about
+  one. Ran it for real: `go run ./cmd/mockprovider` alongside
+  `go run ./example`, then `curl`'d a request through — got the full
+  5-chunk mock stream back exactly as `cmd/governor` itself would
+  produce, proving the library path and the binary path produce
+  identical behavior.
+- `go build`/`go vet`/`go test -race ./...` clean, including 5 new
+  `internal/gateway`-level tests (zero-config mock defaults, the
+  `/debug/metrics` endpoint reflecting real traffic — both over HTTP
+  and via the direct `gw.Metrics` field — and error returns for an
+  unknown provider or a missing API key, proving `gateway.New` fails
+  fast with a real `error` rather than a library caller hitting a
+  `log.Fatal` or nil-pointer panic).
+- Built `governorctl` (`cmd/governorctl`), the last Phase 2 item:
+  bubbletea + lipgloss (both dependencies needed a `go get` run with
+  real network access — same sandbox limitation as `pgx` earlier —
+  done once the user ran it). Two screens, one `model` (pure
+  `Update`/`View` functions, no globals, directly unit-testable without
+  a real terminal): a config form (provider cycled with ←/→, addr/cap/
+  API key fields typed directly, tab/shift-tab to move focus) and a
+  running view. "Start gateway" builds a `gateway.Config` from the
+  form and calls `gateway.New` **in-process** — `governorctl` *is* the
+  daemon host, not a process manager spawning a separate `governor`
+  binary; this was a deliberate scope call to avoid `os/exec`
+  process-lifecycle management and a config-file persistence layer
+  neither CLAUDE.md's plan nor the time available for this session
+  actually demanded. "live usage" is `gw.Metrics.Snapshot()` polled
+  every second via `tea.Tick` — the same public field the library
+  packaging step added specifically so a caller wouldn't need an HTTP
+  round trip for this. `s` stops the daemon (`http.Server.Shutdown`)
+  and returns to the config screen; `q`/`ctrl+c` stops it and quits.
+- Verified for real, not just via unit tests on `Update`: drove the
+  actual compiled binary through a pty (`python3`'s `pty` module, no
+  `expect`/`script` available in this environment) — typed a new
+  listen address into the form, tabbed to "Start gateway", pressed
+  enter, then `curl`'d `/debug/metrics` from *outside* the TUI process
+  and got a real `200` with live counters. Pressed `s`, confirmed the
+  view returned to the config screen. Pressed `ctrl+c`, confirmed the
+  process exited cleanly (code 0) — and confirmed the port was
+  actually released afterward (`curl` got connection-refused, not just
+  a visually-changed screen).
+- `go build`/`go vet`/`go test -race ./...` clean, including 9 new
+  `cmd/governorctl` tests covering focus navigation, text field
+  editing, provider cycling, the start/error/tick message handlers, and
+  that `View()` never panics on either screen.
+- **Phase 2 is done.** All six sections from this session's plan are
+  closed: config loading, OpenAI adapter, Anthropic adapter, real
+  pricing table, observability, library packaging, and the TUI (the
+  plan's 7-item list collapsed the last two into one wrap-up — 7
+  sections planned, 7 delivered). Two things intentionally still need a
+  live key to actually verify against the real APIs (only unit-tested
+  against `httptest` servers emulating each provider's documented wire
+  format so far) — revisit once OpenAI/Anthropic credits exist. Next
+  up is Phase 3 (containerize, CI, deploy, install experience, docs) —
+  explicitly the more flexible/exploratory phase per the plan at the
+  top of this file.
